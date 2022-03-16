@@ -1,8 +1,7 @@
 import unittest
-from b2binpay import client as cl
+from src.b2binpay import client as cl
 from tests.config_test import *
 import asyncio
-
 
 
 class TestClient(unittest.TestCase):
@@ -25,4 +24,3 @@ class TestClient(unittest.TestCase):
         loop.run_until_complete(new_client.close_connection())
 
         self.assertNotEqual({}, wallets)
-

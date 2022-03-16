@@ -2,3 +2,7 @@ venv/
 *__pycache__/
 .idea/
 *.xml
+.env
+build/
+dist/
+*.egg-info/

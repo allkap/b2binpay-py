@@ -10,9 +10,7 @@ import hmac
 from uuid import uuid4
 from loguru import logger
 
-from b2binpay.exeptions import B2BAPIException, B2BRequestException
-
-TEST_MODE = True
+from .exeptions import B2BAPIException, B2BRequestException
 
 
 def convert_dt_to_datetime(dt) -> datetime.datetime:
@@ -25,7 +23,8 @@ class BaseClient:
     TEST_API_URL = "https://api-sandbox.b2binpay.com"
 
     def __init__(
-            self, api_key: Optional[str] = None, api_secret: Optional[str] = None
+            self, api_key: Optional[str] = None, api_secret: Optional[str] = None,
+            test = False
     ):
         """B2BinPay API Client constructor
 
@@ -37,6 +36,7 @@ class BaseClient:
         self._API_KEY = api_key
         self._API_SECRET = api_secret
         self.session = self._init_session()
+        self._TEST = test
 
     def _get_data_connection(self, headers):
         url = self._create_api_uri("token/")
@@ -53,6 +53,9 @@ class BaseClient:
         }
         data = requests.post(url, headers=headers, json=data)
         data = data.json()
+
+        if not data["data"]:
+            raise Exception("Connection data invalid")
 
         self._is_connected = True
         self._access_token = data["data"]["attributes"]["access"]
@@ -80,23 +83,26 @@ class BaseClient:
         raise NotImplementedError
 
     def _create_api_uri(self, path: str) -> str:
-        url = self.API_URL if not TEST_MODE else self.TEST_API_URL
+        url = self.API_URL if not self._TEST else self.TEST_API_URL
         return url + "/" + path
 
 
 class AsyncClient(BaseClient):
 
     def __init__(
-            self, api_key: Optional[str] = None, api_secret: Optional[str] = None, loop=None
+            self, api_key: Optional[str] = None, api_secret: Optional[str] = None,
+            loop=None, test=False
     ):
         self.loop = loop or asyncio.get_event_loop()
-        super().__init__(api_key, api_secret)
+        self._TEST = test
+        super().__init__(api_key, api_secret, test=test)
 
     @classmethod
     async def create(
-            cls, api_key: Optional[str] = None, api_secret: Optional[str] = None):
+            cls, api_key: Optional[str] = None, api_secret: Optional[str] = None,
+                test=False):
 
-        self = cls(api_key, api_secret)
+        self = cls(api_key, api_secret, test=test)
 
         return self
 
