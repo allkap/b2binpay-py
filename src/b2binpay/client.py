@@ -2,13 +2,14 @@ import datetime
 import json
 from typing import Dict, Optional, List
 
-import aiohttp
 import asyncio
-import requests
 import hashlib
 import hmac
 from uuid import uuid4
+import binascii
 from loguru import logger
+import aiohttp
+
 
 from .exeptions import B2BAPIException, B2BRequestException
 
@@ -17,28 +18,58 @@ def convert_dt_to_datetime(dt) -> datetime.datetime:
     dt = dt.replace("T", " ").replace("Z", " ").split('.')[0]
     return datetime.datetime.strptime(dt, '%Y-%m-%d %H:%M:%S')
 
+def expired_more_than_now(dt_expired) -> bool:
+    """Compare some expired datetime utc with datetime now"""
+    dt_expired = convert_dt_to_datetime(dt_expired)
+    dt_now = datetime.datetime.now()
+    dt_delay = dt_now - datetime.datetime.utcnow()
+    return dt_expired > dt_now - dt_delay
 
-class BaseClient:
+
+class AsyncClient:
     API_URL = "https://api.b2binpay.com"
     TEST_API_URL = "https://api-sandbox.b2binpay.com"
 
     def __init__(
-            self, api_key: Optional[str] = None, api_secret: Optional[str] = None,
-            test = False
+            self,
+            api_key: Optional[str] = None,
+            api_secret: Optional[str] = None,
+            loop=None,
+            test=False
     ):
         """B2BinPay API Client constructor
 
-        :param api_key: Api Key
-        :type api_key: str.
-        :param api_secret: Api Secret
-        :type api_secret: str.
-        """
+                :param api_key: Api Key
+                :type api_key: str.
+                :param api_secret: Api Secret
+                :type api_secret: str.
+                """
         self._API_KEY = api_key
         self._API_SECRET = api_secret
-        self.session = self._init_session()
+        self.session = False
+        self._TEST = test
+        self._is_connected = False
+        self.loop = loop or asyncio.get_event_loop()
         self._TEST = test
 
-    def _get_data_connection(self, headers):
+    async def connect(self):
+        self.session = await self._init_session()
+        return self
+
+    async def _validate_connection(self):
+        if not self._is_connected:
+            try:
+                self.session = await self._init_session()
+            except Exception as e:
+                self._is_connected = False
+                logger.exception(e)
+        return self._is_connected
+
+    def _create_api_uri(self, path: str) -> str:
+        url = self.API_URL if not self._TEST else self.TEST_API_URL
+        return url + "/" + path
+
+    async def _get_data_connection(self, headers):
         url = self._create_api_uri("token/")
 
         # Request basic information
@@ -51,13 +82,18 @@ class BaseClient:
                 },
             },
         }
-        data = requests.post(url, headers=headers, json=data)
-        data = data.json()
+
+        session = aiohttp.ClientSession(loop=self.loop,
+                                           headers=headers)
+
+        data = await session.post(url, json=data)
+        data = await data.json()
+
+        await session.close()
 
         if not data["data"]:
             raise Exception("Connection data invalid")
 
-        self._is_connected = True
         self._access_token = data["data"]["attributes"]["access"]
         self._refresh_token = data["data"]["attributes"]["refresh"]
         self._access_expired_at = data["data"]["attributes"]["access_expired_at"]
@@ -66,53 +102,27 @@ class BaseClient:
         self._meta = data["meta"]
         self._message = data["meta"]["time"] + data["data"]["attributes"]["refresh"]
         self._response_sign = data["meta"]["sign"]
-        self._crypted = hashlib.sha256(self._API_KEY.encode() + self._API_SECRET.encode()).hexdigest().encode()
-        self._calculated_sign = hmac.new(self._message.encode(), self._crypted, hashlib.sha256).hexdigest()
+
+        key_secret = self._API_KEY + self._API_SECRET
+        secret = binascii.unhexlify(hashlib.sha256(key_secret.encode()).hexdigest().encode())
+        calc =  hmac.new(secret, msg=self._message.encode(), digestmod=hashlib.sha256).hexdigest()
+
+        if self._response_sign == calc:
+            logger.info('Connection is valid')
+            self._is_connected = True
+        else:
+            return False
+
 
         return data
 
-    def _validate_connection(self, expired_at):
-        dt_now = datetime.datetime.now()
-        expired_at = convert_dt_to_datetime(expired_at)
-        if dt_now > expired_at:
-            logger.error('Connection not valid')
-            return False
-        return True
-
-    def _init_session(self):
-        raise NotImplementedError
-
-    def _create_api_uri(self, path: str) -> str:
-        url = self.API_URL if not self._TEST else self.TEST_API_URL
-        return url + "/" + path
-
-
-class AsyncClient(BaseClient):
-
-    def __init__(
-            self, api_key: Optional[str] = None, api_secret: Optional[str] = None,
-            loop=None, test=False
-    ):
-        self.loop = loop or asyncio.get_event_loop()
-        self._TEST = test
-        super().__init__(api_key, api_secret, test=test)
-
-    @classmethod
-    async def create(
-            cls, api_key: Optional[str] = None, api_secret: Optional[str] = None,
-                test=False):
-
-        self = cls(api_key, api_secret, test=test)
-
-        return self
-
-    def _init_session(self) -> aiohttp.ClientSession:
+    async def _init_session(self) -> aiohttp.ClientSession:
 
         headers = {
             "content-type": "application/vnd.api+json"
         }
 
-        self._get_data_connection(headers)
+        await self._get_data_connection(headers)
 
         headers["authorization"] = f"Bearer {self._access_token}"
         headers["idempotency-key"] = f"{str(uuid4())}"
@@ -125,6 +135,11 @@ class AsyncClient(BaseClient):
         return session
 
     async def refresh(self):
+        if not await self._validate_connection():
+            return
+
+        if not expired_more_than_now(self._refresh_expired_at):
+            self.session = await self._init_session()
 
         url = self._create_api_uri("token/refresh/")
 
@@ -140,8 +155,13 @@ class AsyncClient(BaseClient):
                 },
             },
         }
-        data = requests.post(url, headers=headers, json=data)
-        data = data.json()
+        session = aiohttp.ClientSession(loop=self.loop,
+                                        headers=headers)
+
+        data = await session.post(url, json=data)
+        data = await data.json()
+
+        await session.close()
 
         self._access_token = data["data"]["attributes"]["access"]
         self._refresh_token = data["data"]["attributes"]["refresh"]
@@ -157,11 +177,14 @@ class AsyncClient(BaseClient):
             await self.session.close()
 
     async def _request(self, method, uri: str, data: dict):
-        logger.info(f"Try to make {method} request to url: {uri} with data={data}")
+        # validate connection
+        if not await self._validate_connection():
+            raise Exception("Connection invalid")
 
-        # validate connaction
-        # if not self._validate_connection(self._access_expired_at):
-        #     self.session = self._init_session()
+        if not expired_more_than_now(self._access_expired_at):
+            self.refresh()
+
+        logger.info(f"Try to make {method} request to url: {uri} with data={data}")
 
         # Convert data if special methods called
         for i in ['payout', 'deposit']:
@@ -203,19 +226,19 @@ class AsyncClient(BaseClient):
 
     # Endpoints
     async def get_wallets(self) -> List:
-        return await self._get(f"wallet")
+        return await self._get("wallet")
 
     async def get_wallet(self, wallet_id: str = None) -> Dict:
         return await self._get(f"wallet/{wallet_id}")
 
     async def get_currencies(self) -> List:
-        return await self._get(f"currency")
+        return await self._get("currency")
 
     async def get_currency(self, currency_id: str) -> Dict:
         return await self._get(f"currency/{currency_id}")
 
     async def get_transfers(self) -> List:
-        return await self._get(f"transfer")
+        return await self._get("transfer")
 
     async def get_transfer(self, transfer_id: str) -> Dict:
         """
@@ -238,13 +261,12 @@ class AsyncClient(BaseClient):
         return await self._get(f"deposit/{deposit_id}")
 
     async def get_deposits(self) -> Dict:
-        return await self._get(f"deposit")
+        return await self._get("deposit")
 
     async def create_deposit(self,
                              wallet_id,
                              label="",
-                             tracking_id=""
-                             ,
+                             tracking_id="",
                              callbback_url="",
                              confirmations_needed=1
                              ):
@@ -311,14 +333,14 @@ class AsyncClient(BaseClient):
 
     async def create_payout(self,
                             wallet_id,
-                            label="",
+                            currency_id,
+                            address,
+                            amount,
                             tracking_id="",
-                            address="",
-                            amount=0,
+                            label="",
                             fee_amount=0,
                             callbback_url="",
                             confirmations_needed=1,
-                            currency_id="",
                             ):
 
         if fee_amount in [0, "low", "medium", "high"]:
@@ -382,4 +404,4 @@ class AsyncClient(BaseClient):
                 },
             },
         }
-        return await self._post(f"payout/calculate", data=data)
+        return await self._post("payout/calculate", data=data)

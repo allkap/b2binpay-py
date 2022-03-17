@@ -10,7 +10,7 @@ import asyncio
 
 
 async def main():
-    c = await client.AsyncClient.create("API_KEY", "API_SERCET", test=True)
+    c = await client.AsyncClient("API_KEY", "API_SERCET", test=True).connect()
     w = await c.get_wallets()
     await c.close_connection()
 
