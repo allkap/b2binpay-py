@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setuptools.setup(
     name="b2binpay-python",
-    version="0.0.3",
+    version="0.0.4",
     author="allkap",
     author_email="author@example.com",
     description="Library for working with b2binpay api",
